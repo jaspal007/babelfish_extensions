@@ -22,16 +22,18 @@ extern char     *replace_special_chars_fts_impl(char *input_str);
 static char     *scanbuf;
 static int      scanbuflen;
 
+static char     *mergeTokens(const char* inputStr1, const char* op, const char* inputStr2);
 static char     *translate_simple_term(const char* s);
 static char     *trim(char *s, bool insideQuotes);
 static void     replaceMultipleSpacesAndSpecialChars(char* input, char **str1, char **str2, bool isEnclosedInQuotes);
 
 %}
 
-%token WORD_TOKEN WS_TOKEN TEXT_TOKEN PREFIX_TERM_TOKEN GENERATION_TERM_TOKEN AND_TOKEN NOT_TOKEN AND_NOT_TOKEN OR_TOKEN INFLECTIONAL_TOKEN THESAURUS_TOKEN FORMSOF_TOKEN O_PAREN_TOKEN C_PAREN_TOKEN COMMA_TOKEN SPECIAL_CHAR_TOKEN NON_ENGLISH_TOKEN
+%token WORD_TOKEN WS_TOKEN TEXT_TOKEN PREFIX_TERM_TOKEN GENERATION_TERM_TOKEN AND_TOKEN NOT_TOKEN AND_NOT_TOKEN OR_TOKEN O_PAREN_TOKEN C_PAREN_TOKEN INFLECTIONAL_TOKEN THESAURUS_TOKEN FORMSOF_TOKEN COMMA_TOKEN SPECIAL_CHAR_TOKEN NON_ENGLISH_TOKEN
 %left OR_TOKEN
 %left AND_TOKEN
 %left AND_NOT_TOKEN
+%left O_PAREN_TOKEN
 
 %start contains_search_condition
 %define api.prefix {fts_yy}
@@ -42,37 +44,87 @@ static void     replaceMultipleSpacesAndSpecialChars(char* input, char **str1, c
 %%
 
 contains_search_condition:
+   multiple_term {
+        *result = $1;
+   }
+   ;
+
+
+multiple_term:
+    search_term {
+        $$ = $1;
+    }
+    | enclosed_term {
+        $$ = $1;
+    }
+    | search_term bool_operator multiple_term {
+        $$ = mergeTokens($1, $2, $3);
+    }
+    | enclosed_term bool_operator multiple_term {
+        $$ = mergeTokens($1, $2, $3);
+    }
+    ;
+
+
+enclosed_term:
+    O_PAREN_TOKEN multiple_term C_PAREN_TOKEN {
+        $$ = mergeTokens($1, $2, $3);
+    }
+    | WS_TOKEN O_PAREN_TOKEN multiple_term C_PAREN_TOKEN {
+        $$ = mergeTokens($2, $3, $4);
+    }
+    | O_PAREN_TOKEN multiple_term C_PAREN_TOKEN WS_TOKEN {
+        $$ = mergeTokens($1, $2, $3);
+    }
+    | WS_TOKEN O_PAREN_TOKEN multiple_term C_PAREN_TOKEN WS_TOKEN {
+        $$ = mergeTokens($2, $3, $4);
+    }
+    ;
+
+
+bool_operator:
+    AND_TOKEN {
+        $$ = " & ";
+    }
+    | OR_TOKEN {
+        $$ = " | ";
+    }
+    | AND_NOT_TOKEN {
+        $$ = " &! ";
+    }
+    ;
+
+search_term:
     generation_term
     | simple_term
     | prefix_term
     ;
+    
 
 simple_term:
-    WORD_TOKEN  {
-        *result = translate_simple_term($1);
+    keyword {
+        $$ = $1;
     }
-    | TEXT_TOKEN {
-        *result = translate_simple_term($1);
+    | WS_TOKEN keyword {
+        $$ = $2;
     }
-    | WS_TOKEN WORD_TOKEN {
-        *result = translate_simple_term($2);
+    | keyword WS_TOKEN {
+        $$ = $1;
     }
-    | WORD_TOKEN WS_TOKEN {
-        *result = translate_simple_term($1);
-    }
-    | WS_TOKEN WORD_TOKEN WS_TOKEN {
-        *result = translate_simple_term($2);
-    }
-    | WS_TOKEN TEXT_TOKEN {
-        *result = translate_simple_term($2);
-    }
-    | TEXT_TOKEN WS_TOKEN {
-        *result = translate_simple_term($1);
-    }
-    | WS_TOKEN TEXT_TOKEN WS_TOKEN {
-        *result = translate_simple_term($2);
+    | WS_TOKEN keyword WS_TOKEN {
+        $$ = $2;
     }
     ;
+
+keyword:
+    WORD_TOKEN {
+        $$ = translate_simple_term($1);
+    }
+    | TEXT_TOKEN {
+        $$ = translate_simple_term($1);
+    }
+    ;
+
 
 prefix_term:
     PREFIX_TERM_TOKEN {
@@ -109,6 +161,20 @@ simple_term_list:
 
 %%
 
+
+static char
+*mergeTokens(const char* inputStr1, const char* inputStr2, const char* inputStr3) {
+    StringInfoData  bufStr;
+    initStringInfo(&bufStr);
+
+    appendStringInfoString(&bufStr, inputStr1);
+    appendStringInfoString(&bufStr, inputStr2);
+    appendStringInfoString(&bufStr, inputStr3);
+
+    return bufStr.data;
+}
+
+
 /* Helper function that takes in a word or phrase and returns the same word/phrase in Postgres format
  * Example: 'word' is rewritten into 'word'; '"word1 word2 word3"' is rewritten into 'word1<->word2<->word3'
  * Case 1: 'word' = 'word'
@@ -124,6 +190,7 @@ static char
     char            *leftStr;
     char            *rightStr;
     bool            isEnclosedInQuotes = false;
+    bool            isPhrase = false;
     StringInfoData  output;
     const char	    *inputPtr;
 
@@ -155,7 +222,7 @@ static char
     inputLength = strlen(leftStr);
 
     initStringInfo(&output);
-    appendStringInfoString(&output, "");
+    appendStringInfoString(&output, "(");
 
     /* for strings with special characters `, ', and _ (these result in exact matches) */
     if(strpbrk("`'_", leftStr) != NULL) {
@@ -169,6 +236,7 @@ static char
     /* Initialize pointers for input and output */
     for (inputPtr = leftStr; *inputPtr != '\0'; inputPtr++) {
         if (isspace((unsigned char)*inputPtr)) {
+            isPhrase = true;
             /* Replace space with "<->" */
             while (isspace((unsigned char)*(inputPtr + 1))) {
                 /* Handle multiples spaces between words and skip over additional spaces */
@@ -181,11 +249,16 @@ static char
         }
     }
 
-    /* check for empty strings i.e. "" */
+    /* check for empty strings i.e. ""*/
     if (output.len > 0) {
-        appendStringInfo(&output, " | ('%s')", replace_special_chars_fts_impl(rightStr));
-    }
+        if(isEnclosedInQuotes) {
+            if(isPhrase) {
+                appendStringInfo(&output, " | ('%s')", replace_special_chars_fts_impl(rightStr));
+            }
+        }
+    } 
 
+    appendStringInfoChar(&output, ')');
     appendStringInfoChar(&output, '\0');
 
     pfree(leftStr);
@@ -212,7 +285,7 @@ replaceMultipleSpacesAndSpecialChars(char* input, char **str1, char **str2, bool
     StringInfoData  modifiedInput;
     const char      *specialChars = "~!&|@#$%^*+=\\;:<>?.\\/";
     const char      *boolOperators = "&!|";
-    const char      *forbiddenChars = "([{]})\"";
+    const char      *forbiddenChars = "[{]}\"";
     const char      *charInForbiddenChars;
     const char      *charInSpecialChars;
     const char      *charInBoolOperators;
@@ -277,7 +350,7 @@ replaceMultipleSpacesAndSpecialChars(char* input, char **str1, char **str2, bool
         if (charInBoolOperators != NULL) {
             ereport(ERROR,
                 (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                 errmsg("Full-text search conditions with boolean operators are not currently supported in Babelfish")));
+                 errmsg("Syntax error in the full-text search condition")));
         }
 
         /* Check for forbidden characters when not in quotes */
